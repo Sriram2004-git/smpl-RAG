@@ -1,8 +1,12 @@
-streamlit
+flask
+flask-cors
+python-dotenv
 langchain
 langchain-community
 langchain-core
+langchain-text-splitters
+langchain-ollama
 chromadb
 pypdf
-ollama
-langchain-text-splitters
+huggingface-hub
+numpy

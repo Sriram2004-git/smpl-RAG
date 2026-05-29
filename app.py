@@ -1,76 +1,105 @@
-import streamlit as st
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import tempfile
 import os
+from dotenv import load_dotenv
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.llms import Ollama
-
 from langchain_community.vectorstores import Chroma
-from langchain.chains import RetrievalQA
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama import ChatOllama
+from langchain_core.embeddings import Embeddings
+from huggingface_hub import InferenceClient
+import numpy as np
+
+load_dotenv()
+
+app = Flask(__name__)
+CORS(app)
+
+HF_MODEL = "flax-sentence-embeddings/all_datasets_v3_mpnet-base"
+OLLAMA_MODEL = "qwen3-vl:235b-cloud"
 
 
-st.set_page_config(page_title="PDF RAG with LLaMA2", layout="wide")
-st.title("PDF QA")
+class HFEmbeddings(Embeddings):
+    def __init__(self):
+        self.client = InferenceClient(
+            provider="hf-inference",
+            api_key=os.environ["HF_TOKEN"],
+        )
 
-uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"])
-user_question = st.text_input("Ask a question from the PDF:")
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._embed(t) for t in texts]
 
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed(text)
 
-embeddings = OllamaEmbeddings(
-    model="all-minilm"
-)
-
-llm = Ollama(
-    model="llama2",
-    temperature=0
-)
-
-
-if uploaded_file:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        pdf_path = tmp_file.name
-
-    loader = PyPDFLoader(pdf_path)
-    documents = loader.load()
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
-    )
-
-    splits = text_splitter.split_documents(documents)
+    def _embed(self, text: str) -> list[float]:
+        result = self.client.feature_extraction(text, model=HF_MODEL)
+        arr = np.array(result)
+        if arr.ndim == 2:
+            arr = arr.mean(axis=0)
+        return arr.tolist()
 
 
-    vectorstore = Chroma.from_documents(
-        documents=splits,
-        embedding=embeddings,
-        persist_directory="./chroma_db"
-    )
-
-    retriever = vectorstore.as_retriever(
-        search_kwargs={"k": 3}
-    )
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"status": "PDF RAG API is running"})
 
 
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=False
-    )
+@app.route("/ask", methods=["POST"])
+def ask():
+    pdf_file = request.files.get("pdf")
+    question = request.form.get("question", "").strip()
 
-    st.success("PDF loaded and indexed successfully!")
+    if not pdf_file:
+        return jsonify({"error": "No PDF file provided"}), 400
+    if not question:
+        return jsonify({"error": "No question provided"}), 400
+
+    pdf_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            pdf_file.save(tmp)
+            pdf_path = tmp.name
+
+        loader = PyPDFLoader(pdf_path)
+        documents = loader.load()
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        splits = splitter.split_documents(documents)
+
+        embeddings = HFEmbeddings()
+        vectordb = Chroma.from_documents(documents=splits, embedding=embeddings)
+
+        llm = ChatOllama(
+            model=OLLAMA_MODEL,
+            temperature=0,
+            base_url="https://api.ollama.com",
+            headers={"Authorization": f"Bearer {os.environ['OLLAMA_API_KEY']}"},
+        )
+
+        retriever = vectordb.as_retriever(search_kwargs={"k": 3})
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Answer the question using only the context below:\n\n{context}"),
+            ("human", "{input}"),
+        ])
+        qa_chain = create_retrieval_chain(retriever, create_stuff_documents_chain(llm, prompt))
+
+        result = qa_chain.invoke({"input": question})
+        return jsonify({"answer": result["answer"]})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if pdf_path and os.path.exists(pdf_path):
+            os.remove(pdf_path)
 
 
-    if user_question:
-        with st.spinner("Thinking..."):
-            answer = qa_chain.invoke({"query": user_question})
-
-        st.subheader("Answer:")
-        st.write(answer)
-
-    os.remove(pdf_path)
+if __name__ == "__main__":
+    app.run(debug=False)
